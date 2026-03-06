@@ -1,0 +1,2365 @@
+cascade_net/
+│
+├── config.py
+│
+├── datapipe/
+│   ├── __init__.py
+│   ├── loader.py
+│   ├── cascade.py
+│   └── scenarios.py
+│
+├── models/
+│   ├── __init__.py
+│   ├── stress_encoder.py
+│   ├── gnn_layers.py
+│   ├── heads.py
+│   ├── cascadenet.py
+│   └── baselines.py
+│
+├── training/
+│   ├── __init__.py
+│   ├── loss.py
+│   ├── trainer.py
+│   └── baseline_trainer.py
+│
+├── evaluation/
+│   ├── __init__.py
+│   ├── runner.py
+│   ├── metrics.py
+│   └── visualization.py
+│
+├── data/
+│   └── interbank/
+│       └── datasets/
+│           ├── edges/
+│           └── nodes/
+│       └── images/
+│       └── methods/
+│       └── models/
+│       └── results/
+│       └── .gitignore
+│       └── LICENSE
+│       └── README.md
+│
+├── main.py
+├── inspect_data.py
+└── README.md
+
+
+datapipe/cascade.py:
+"""
+Eisenberg-Noe cascade simulation — full computation, parallelized.
+
+No imputation: cascade size is computed for every node via fixed-point
+iteration on the interbank payment system.
+"""
+
+import numpy as np
+from scipy import sparse as sp
+from joblib import Parallel, delayed
+from typing import Tuple
+
+
+def eisenberg_noe_cascade(
+    adj_T: sp.csr_matrix,
+    liabilities: np.ndarray,
+    assets: np.ndarray,
+    trigger_node: int,
+    lgd: float,
+    max_rounds: int = 50,
+) -> int:
+    """
+    Compute cascade size when a single node defaults.
+
+    Uses Eisenberg-Noe fixed-point clearing: defaulted nodes pay
+    (1 - LGD) fraction of their obligations. Iterate until no new
+    defaults occur.
+
+    Args:
+        adj_T: transposed weighted adjacency (N×N sparse).
+                adj_T[i,j] = exposure of i to j.
+        liabilities: total liabilities per node (N,).
+        assets: external assets per node (N,).
+        trigger_node: index of initially defaulting node.
+        lgd: loss given default ∈ (0, 1).
+        max_rounds: max contagion iterations.
+
+    Returns:
+        Number of additional defaults caused (excluding trigger).
+    """
+    N = len(assets)
+    solvent = np.ones(N, dtype=bool)
+    solvent[trigger_node] = False
+
+    for _ in range(max_rounds):
+        # Payment rates: solvent nodes pay 100%, defaulted pay (1-LGD)
+        pay_rate = np.where(solvent, 1.0, 1.0 - lgd)
+
+        # Income = external assets + payments received from counterparties
+        income = assets + adj_T @ pay_rate
+
+        # Check solvency
+        new_solvent = solvent.copy()
+        new_solvent[solvent & (income < liabilities)] = False
+
+        if np.array_equal(new_solvent, solvent):
+            break
+        solvent = new_solvent
+
+    # Cascade size = total defaults minus the trigger
+    return max(0, int((~solvent).sum()) - 1)
+
+
+def multi_trigger_cascade(
+    adj_T: sp.csr_matrix,
+    liabilities: np.ndarray,
+    assets: np.ndarray,
+    initial_defaults: np.ndarray,
+    lgd: float,
+    max_rounds: int = 50,
+) -> Tuple[np.ndarray, int]:
+    """
+    Cascade from multiple simultaneous initial defaults.
+
+    Args:
+        initial_defaults: boolean mask (N,) of fundamentally defaulting nodes.
+
+    Returns:
+        (all_defaults_mask, n_contagion_defaults)
+    """
+    N = len(assets)
+    solvent = ~initial_defaults.copy()
+
+    for _ in range(max_rounds):
+        pay_rate = np.where(solvent, 1.0, 1.0 - lgd)
+        income = assets + adj_T @ pay_rate
+        new_solvent = solvent.copy()
+        new_solvent[solvent & (income < liabilities)] = False
+
+        if np.array_equal(new_solvent, solvent):
+            break
+        solvent = new_solvent
+
+    all_defaults = ~solvent
+    n_contagion = max(0, int(all_defaults.sum() - initial_defaults.sum()))
+    return all_defaults, n_contagion
+
+
+def compute_all_cascades(
+    adj_T: sp.csr_matrix,
+    liabilities: np.ndarray,
+    assets: np.ndarray,
+    lgd: float,
+    n_jobs: int = -1,
+) -> np.ndarray:
+    """
+    Compute single-trigger cascade size for EVERY node. Parallelized.
+
+    This is the key fix over the original: no linear imputation.
+    Full EN fixed-point for each of N nodes.
+
+    Args:
+        n_jobs: number of parallel workers. -1 = all cores.
+
+    Returns:
+        cascade_sizes: (N,) array of cascade sizes per node.
+    """
+    N = len(assets)
+
+    def _single(i):
+        return eisenberg_noe_cascade(adj_T, liabilities, assets, i, lgd)
+
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_single)(i) for i in range(N)
+    )
+
+    return np.array(results, dtype=np.float32)
+
+
+
+
+
+
+datapipe/loader.py:
+"""
+Data loading: AI4Risk/interbank dataset or synthetic fallback.
+
+AI4Risk layout (discovered via inspect_data.py):
+    datasets/
+    ├── edges/edge_2022Q4.csv     # Sourceid, Targetid, Weights
+    └── nodes/2022Q4.csv          # index, 70 features, rank_next_quarter, srisk_ratio, srisk_value
+
+Node columns (74 total):
+    [0]     index                        — bank sequential ID
+    [1:71]  Total_assets ... Net_interest_margin_(interest_earning_assets)  — 70 financial features
+    [71]    rank_next_quarter            — credit rating 1-4 (mapped to 0-3)
+    [72]    srisk_ratio                  — SRISK ratio (may be NaN)
+    [73]    srisk_value                  — SRISK value (may be NaN)
+"""
+
+import os
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import torch
+from torch_geometric.data import Data
+from scipy import sparse as sp
+
+from config import Config
+
+
+def load_data(cfg: Config) -> Dict:
+    if cfg.synthetic:
+        print("[Data] Synthetic mode — generating directed BA graph")
+        return _load_synthetic(cfg)
+    return _load_ai4risk(cfg)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# AI4Risk loader
+# ═══════════════════════════════════════════════════════════════════════
+
+def _load_ai4risk(cfg: Config) -> Dict:
+    root = Path(cfg.data_dir)
+    q = cfg.quarter
+
+    if not root.exists():
+        raise FileNotFoundError(
+            f"Data directory not found: {root}\n"
+            f"  git clone https://github.com/AI4Risk/interbank.git\n"
+            f"  Copy datasets/ folder into data/interbank/"
+        )
+
+    # ── Locate files ─────────────────────────────────────────────
+    node_path = _find_node_file(root, q)
+    edge_path = _find_edge_file(root, q)
+
+    if node_path is None or edge_path is None:
+        _print_available(root, q, edge_path, node_path)
+        raise FileNotFoundError(f"Missing files for quarter {q}")
+
+    print(f"[Data] Loading AI4Risk — quarter {q}")
+    print(f"  Nodes: {node_path.relative_to(root)}")
+    print(f"  Edges: {edge_path.relative_to(root)}")
+
+    # ── Load node file ───────────────────────────────────────────
+    node_df = pd.read_csv(node_path)
+    N = len(node_df)
+
+    # Column layout: index | 70 features | rank_next_quarter | srisk_ratio | srisk_value
+    # Drop 'index' column, extract features and labels
+    if "index" in node_df.columns or node_df.columns[0].lower() == "index":
+        node_df = node_df.drop(columns=[node_df.columns[0]])
+
+    # Last 3 columns are labels
+    feature_cols = node_df.columns[:-3]
+    X = node_df[feature_cols].values.astype(np.float32)
+
+    # Labels
+    rank_col = node_df.iloc[:, -3]  # rank_next_quarter (1-4)
+    srisk_ratio = pd.to_numeric(node_df.iloc[:, -2], errors="coerce").fillna(0.0).values.astype(np.float32)
+    srisk_value = pd.to_numeric(node_df.iloc[:, -1], errors="coerce").fillna(0.0).values.astype(np.float32)
+
+    # Convert rank 1-4 → 0-3  (1=A=best, 4=D=worst)
+    ratings = pd.to_numeric(rank_col, errors="coerce").fillna(2).values.astype(int)
+    ratings = np.clip(ratings - 1, 0, 3)  # 1-based → 0-based
+
+    # Handle NaN in features
+    X = _normalize(X)
+    n_feat = X.shape[1]
+
+    print(f"  N={N}, features={n_feat}")
+    print(f"  Ratings (0=A,1=B,2=C,3=D): {dict(zip(*np.unique(ratings, return_counts=True)))}")
+    print(f"  SRISK ratio: {np.nanmean(srisk_ratio):.2f} avg, "
+          f"{np.isnan(node_df.iloc[:, -2].values.astype(float)).sum()} NaN")
+
+    # ── Load edges ───────────────────────────────────────────────
+    edge_df = pd.read_csv(edge_path)
+    # Columns: Sourceid, Targetid, Weights
+    src = edge_df.iloc[:, 0].values.astype(int)
+    tgt = edge_df.iloc[:, 1].values.astype(int)
+    wt = edge_df.iloc[:, 2].values.astype(np.float32)
+
+    # Remap if node IDs exceed N
+    src, tgt, wt = _remap_edges(src, tgt, wt, N)
+    wt = np.nan_to_num(wt, nan=1.0)
+    wt_norm = wt / (wt.max() + 1e-8)
+
+    num_edges = len(src)
+    print(f"  Edges={num_edges}, avg_degree={num_edges / N:.1f}")
+
+    # ── Build PyG + sparse ───────────────────────────────────────
+    pyg = Data(
+        x=torch.tensor(X, dtype=torch.float32),
+        edge_index=torch.tensor(np.stack([src, tgt]), dtype=torch.long),
+        edge_weight=torch.tensor(wt_norm, dtype=torch.float32),
+        num_nodes=N,
+    )
+    # Use raw weights for cascade simulation (not normalized)
+    adj = sp.csr_matrix((wt, (src, tgt)), shape=(N, N))
+
+    # ── Network features ─────────────────────────────────────────
+    print(f"  Computing network centralities...")
+    net_feats = _compute_network_features(src, tgt, wt_norm, N)
+
+    cfg.node_feature_dim = n_feat
+
+    return {
+        "pyg_data": pyg,
+        "adj_sparse": adj,
+        "labels": ratings,
+        "srisk_ratio": srisk_ratio,
+        "srisk_value": srisk_value,
+        "node_features_raw": X,
+        "network_features": net_feats,
+        "metadata": {
+            "num_nodes": N, "num_edges": num_edges,
+            "avg_degree": num_edges / N,
+            "data_source": "ai4risk", "quarter": q,
+            "rating_distribution": {
+                int(k): int(v)
+                for k, v in zip(*np.unique(ratings, return_counts=True))
+            },
+        },
+    }
+
+
+# ─── File finders (exact AI4Risk layout) ────────────────────────
+
+def _find_node_file(root: Path, quarter: str) -> Optional[Path]:
+    """Find node file: nodes/{quarter}.csv or nodes/node_{quarter}.csv"""
+    candidates = [
+        root / "nodes" / f"{quarter}.csv",
+        root / "nodes" / f"node_{quarter}.csv",
+        root / f"nodes_{quarter}.csv",
+        root / f"{quarter}_node.csv",
+        root / f"{quarter}_feature.csv",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # Glob fallback
+    for pat in [f"nodes/*{quarter}*", f"*{quarter}*node*", f"*{quarter}*feature*"]:
+        m = list(root.glob(pat))
+        if m:
+            return sorted(m)[0]
+    return None
+
+
+def _find_edge_file(root: Path, quarter: str) -> Optional[Path]:
+    """Find edge file: edges/edge_{quarter}.csv"""
+    candidates = [
+        root / "edges" / f"edge_{quarter}.csv",
+        root / "edges" / f"{quarter}_edge.csv",
+        root / "edges" / f"{quarter}.csv",
+        root / f"edge_{quarter}.csv",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    for pat in [f"edges/*{quarter}*", f"*{quarter}*edge*"]:
+        m = list(root.glob(pat))
+        if m:
+            return sorted(m)[0]
+    return None
+
+
+def _print_available(root, quarter, edge_path, node_path):
+    print(f"\n  Files not found for quarter {quarter}:")
+    print(f"    edge: {'OK' if edge_path else 'MISSING'}")
+    print(f"    node: {'OK' if node_path else 'MISSING'}")
+    print(f"\n  Available:")
+    for f in sorted(root.rglob("*.csv"))[:20]:
+        print(f"    {f.relative_to(root)}")
+
+
+# ─── Edge remapping ─────────────────────────────────────────────
+
+def _remap_edges(src, tgt, wt, N):
+    max_id = max(src.max(), tgt.max())
+    if max_id < N and src.min() >= 0:
+        return src, tgt, wt
+
+    all_ids = np.unique(np.concatenate([src, tgt]))
+    id_map = {old: new for new, old in enumerate(sorted(all_ids))}
+
+    valid = np.array([
+        s in id_map and t in id_map and id_map[s] < N and id_map[t] < N
+        for s, t in zip(src, tgt)
+    ])
+    new_src = np.array([id_map[s] for s, v in zip(src, valid) if v])
+    new_tgt = np.array([id_map[t] for t, v in zip(tgt, valid) if v])
+    new_wt = wt[valid]
+    print(f"  Remapped {len(all_ids)} IDs → [0,{N-1}] ({valid.sum()} edges)")
+    return new_src, new_tgt, new_wt
+
+
+# ─── Normalization ───────────────────────────────────────────────
+
+def _normalize(X: np.ndarray) -> np.ndarray:
+    for j in range(X.shape[1]):
+        col = X[:, j]
+        nans = np.isnan(col)
+        if nans.any():
+            med = np.nanmedian(col)
+            X[nans, j] = med if not np.isnan(med) else 0.0
+
+    lo = X.min(axis=0, keepdims=True)
+    hi = X.max(axis=0, keepdims=True)
+    return ((X - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Synthetic fallback
+# ═══════════════════════════════════════════════════════════════════════
+
+def _load_synthetic(cfg: Config) -> Dict:
+    rng = np.random.RandomState(cfg.seed)
+    N = cfg.num_nodes
+
+    G = nx.barabasi_albert_graph(N, cfg.ba_edges_per_node, seed=cfg.seed)
+    rows, cols, vals = [], [], []
+    for u, v in G.edges():
+        w = float(rng.lognormal(2.0, 1.0))
+        r = rng.random()
+        if r < 0.5:
+            rows.append(u); cols.append(v); vals.append(w)
+        elif r < 0.8:
+            rows.append(v); cols.append(u); vals.append(w)
+        else:
+            rows.append(u); cols.append(v); vals.append(w)
+            rows.append(v); cols.append(u); vals.append(w * rng.uniform(0.3, 0.7))
+
+    rows, cols = np.array(rows), np.array(cols)
+    vals = np.array(vals, dtype=np.float32)
+    vals_norm = vals / (vals.max() + 1e-8)
+
+    X = rng.randn(N, cfg.synth_feature_dim).astype(np.float32)
+    X = (X - X.min(0)) / (X.max(0) - X.min(0) + 1e-8)
+    z = 2.0 * X[:, 0] - 1.5 * X[:, 1] + 0.5 * X[:, 2]
+    ratings = np.digitize(z, bins=np.percentile(z, [25, 50, 75]))
+
+    pyg = Data(
+        x=torch.tensor(X, dtype=torch.float32),
+        edge_index=torch.tensor(np.stack([rows, cols]), dtype=torch.long),
+        edge_weight=torch.tensor(vals_norm, dtype=torch.float32),
+        num_nodes=N,
+    )
+    adj = sp.csr_matrix((vals, (rows, cols)), shape=(N, N))
+    net_feats = _compute_network_features(rows, cols, vals_norm, N)
+    cfg.node_feature_dim = cfg.synth_feature_dim
+
+    return {
+        "pyg_data": pyg, "adj_sparse": adj,
+        "labels": ratings,
+        "srisk_ratio": np.zeros(N, dtype=np.float32),
+        "srisk_value": np.zeros(N, dtype=np.float32),
+        "node_features_raw": X,
+        "network_features": net_feats,
+        "metadata": {
+            "num_nodes": N, "num_edges": len(rows),
+            "avg_degree": len(rows) / N,
+            "data_source": "synthetic", "quarter": "N/A",
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Network features
+# ═══════════════════════════════════════════════════════════════════════
+
+def _compute_network_features(src, tgt, weights, N: int) -> np.ndarray:
+    G = nx.DiGraph()
+    G.add_nodes_from(range(N))
+    for s, t, w in zip(src, tgt, weights):
+        G.add_edge(int(s), int(t), weight=float(w))
+
+    # PageRank: increase iterations, handle convergence failure
+    try:
+        pr = nx.pagerank(G, alpha=0.85, max_iter=500, tol=1e-4)
+    except nx.PowerIterationFailedConvergence:
+        print("  PageRank did not converge, using degree-based fallback")
+        dg_sum = sum(dict(G.degree()).values()) or 1
+        pr = {i: G.degree(i) / dg_sum for i in range(N)}
+
+    Gu = G.to_undirected()
+    bc = nx.betweenness_centrality(Gu, k=min(200, N))
+    cc = nx.clustering(Gu)
+    dg = dict(G.degree())
+
+    feats = np.zeros((N, 4), dtype=np.float32)
+    for i in range(N):
+        feats[i] = [pr.get(i, 0), bc.get(i, 0), cc.get(i, 0), dg.get(i, 0)]
+
+    for j in range(4):
+        col = feats[:, j]
+        lo, hi = col.min(), col.max()
+        feats[:, j] = (col - lo) / (hi - lo + 1e-8)
+
+    return feats
+
+
+
+
+
+
+
+datapipe/scenarios.py:
+"""
+Stress scenario generation and train/val/test splitting.
+
+Each scenario:
+  1. Sample stress vector s ∈ [0,1]^stress_dim
+  2. Compute stress-conditioned default threshold per node
+  3. Run multi-trigger EN cascade for contagion defaults
+  4. Compute per-node cascade sizes (full, parallelized)
+"""
+
+import numpy as np
+from scipy import sparse as sp
+from tqdm import tqdm
+from typing import Dict, List, Tuple
+
+from config import Config
+from .cascade import multi_trigger_cascade, compute_all_cascades
+
+
+def generate_scenarios(
+    cfg: Config,
+    node_features: np.ndarray,
+    adj_sparse: sp.csr_matrix,
+    labels: np.ndarray,
+) -> List[Dict]:
+    rng = np.random.RandomState(cfg.seed)
+    N = node_features.shape[0]
+
+    adj_T = adj_sparse.T.tocsr()
+    liabilities = np.array(adj_sparse.sum(axis=1)).flatten()
+    base_assets = _compute_base_assets(labels, rng, N, adj_sparse)
+    stress_sens = _compute_stress_sensitivity(node_features)
+    fund_pd = _compute_fundamental_pd(node_features, labels)
+
+    scenarios = []
+    print(f"\n[Scenarios] Generating {cfg.num_scenarios} stress scenarios...")
+    print(f"  Workers: {cfg.cascade_workers}, LGD: {cfg.lgd}")
+    print(f"  Target default rate: {cfg.base_default_rate:.1%} – "
+          f"{cfg.stress_max_default_rate:.1%}")
+
+    for i in tqdm(range(cfg.num_scenarios), desc="Scenarios"):
+        stress = rng.uniform(0, 1, cfg.stress_dim).astype(np.float32)
+        sl = stress.mean()
+
+        threshold = _stress_threshold(
+            fund_pd, stress_sens, sl,
+            cfg.base_default_rate, cfg.stress_max_default_rate,
+        )
+        initial_defaults = fund_pd > threshold
+
+        # Stress affects:
+        #   1. External assets decrease (economic downturn)
+        #   2. LGD increases (recovery rates drop)
+        #   3. Interbank obligations (liabilities) stay UNCHANGED
+        #      — they are contractual, not market-driven
+        asset_shock = 1.0 - 0.25 * sl       # up to -25% asset reduction
+        stressed_lgd = min(0.9, cfg.lgd + 0.3 * sl)  # LGD: 0.45 → up to 0.75
+        s_assets = base_assets * asset_shock
+
+        all_defaults, n_contagion = multi_trigger_cascade(
+            adj_T, liabilities, s_assets, initial_defaults, stressed_lgd,
+        )
+
+        cascade_sizes = compute_all_cascades(
+            adj_T, liabilities, s_assets, stressed_lgd,
+            n_jobs=cfg.cascade_workers,
+        )
+
+        sc = {
+            "stress": stress,
+            "labels": all_defaults.astype(np.float32),
+            "cascade_sizes": cascade_sizes,
+            "n_initial_defaults": int(initial_defaults.sum()),
+            "n_contagion_defaults": int(n_contagion),
+            "contagion_mask": (all_defaults & ~initial_defaults),
+            "default_rate": float(all_defaults.mean()),
+        }
+        scenarios.append(sc)
+
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"    [{i+1}] default_rate={sc['default_rate']:.2%}, "
+                  f"contagion={n_contagion}, stress={sl:.2f}")
+
+    _print_summary(scenarios)
+    return scenarios
+
+
+def split_scenarios(
+    scenarios: List[Dict], cfg: Config,
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    n = len(scenarios)
+    n_test = max(2, int(n * cfg.test_ratio))
+    n_val = max(1, int(n * cfg.val_ratio))
+    n_train = n - n_test - n_val
+
+    sc_train = scenarios[:n_train]
+    sc_val = scenarios[n_train:n_train + n_val]
+    sc_test = scenarios[n_train + n_val:]
+
+    print(f"\n[Split] {len(sc_train)} train / {len(sc_val)} val / "
+          f"{len(sc_test)} test")
+    return sc_train, sc_val, sc_test
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Helpers — adapted for AI4Risk 70-feature layout
+#
+# Key AI4Risk columns (0-indexed after dropping 'index'):
+#   0: Total_assets
+#   1: Total_liabilities
+#   2: Equity
+#   3: Liquid_assets
+#   4: Deposits_and_short-term_funding
+#   5: Long-term_funding
+#   6: Net_income
+#   7: Interbank_assets
+#   8: Interbank_liabilities
+#   9: ROAE
+#  10: Wholesale_funding
+#  11: Growth_in_total_assets
+#  12: Impaired_loans_ratio
+#  ...
+#  15: NCO_ratio
+#  16: Unreserved_impaired / equity
+#  17: CET1
+#  18: Total_Capital
+# ═══════════════════════════════════════════════════════════════════
+
+def _compute_fundamental_pd(features: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """
+    PD from credit ratings + feature-based perturbation.
+
+    For AI4Risk: ratings 0-3 give base PD, features add continuous signal.
+    For synthetic: logistic combination of first few features.
+    """
+    N = features.shape[0]
+    n_feat = features.shape[1]
+
+    if n_feat >= 70:
+        # Base PD from rating (0=A best → 3=D worst)
+        base_pd = np.array([0.01, 0.05, 0.15, 0.40])[np.clip(labels, 0, 3)]
+
+        # Modulate by financial health indicators (all normalized to [0,1]):
+        #   Higher equity ratio → lower PD
+        #   Higher impaired loans → higher PD
+        #   Lower liquidity → higher PD
+        equity = features[:, 2]        # Equity (higher = safer)
+        liquidity = features[:, 3]     # Liquid_assets (higher = safer)
+        impaired = features[:, 12] if n_feat > 12 else 0.5  # Impaired_loans ratio
+        cet1 = features[:, 17] if n_feat > 17 else 0.5      # CET1
+
+        # Combine: higher score = healthier = lower PD multiplier
+        health = 0.3 * equity + 0.25 * liquidity + 0.25 * cet1 + 0.2 * (1 - impaired)
+        # Map health [0,1] → PD multiplier [0.5, 1.5]
+        multiplier = 1.5 - health
+
+        pd = base_pd * multiplier
+        return np.clip(pd, 0.001, 0.95).astype(np.float32)
+    else:
+        # Synthetic
+        w = np.zeros(n_feat)
+        w[0] = 3.0; w[1] = -2.0
+        if n_feat > 5: w[5] = -1.5
+        z = features @ w - 1.0
+        return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+
+
+def _compute_stress_sensitivity(features: np.ndarray) -> np.ndarray:
+    """How sensitive is each node to macro stress. ∈ [0, 1]."""
+    n_feat = features.shape[1]
+
+    if n_feat >= 70:
+        # Banks with high wholesale funding, low liquidity, high leverage
+        # are more stress-sensitive
+        wholesale = features[:, 10] if n_feat > 10 else 0.5   # Wholesale_funding
+        liquidity = features[:, 3]                              # Liquid_assets
+        interbank = features[:, 7] if n_feat > 7 else 0.5     # Interbank_assets
+
+        z = 2.0 * wholesale - 1.5 * liquidity + 0.8 * interbank - 0.5
+    else:
+        z = 2.0 * features[:, 0] - 1.5 * features[:, 1] - 0.3
+
+    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+
+
+def _stress_threshold(fund_pd, stress_sens, stress_level, base_rate, max_rate):
+    base_thr = np.percentile(fund_pd, 100 * (1 - base_rate))
+    max_thr = np.percentile(fund_pd, 100 * (1 - max_rate))
+    effective = stress_level * stress_sens
+    return base_thr - (base_thr - max_thr) * effective
+
+
+def _compute_base_assets(labels, rng, N, adj_sparse=None):
+    """
+    External assets per node, calibrated to actual interbank liabilities.
+
+    Key insight: assets must be proportional to liabilities, otherwise
+    the EN cascade trivially defaults everything (or nothing).
+
+    Calibration: asset_i = buffer_i * liability_i + noise
+      - A-rated banks: buffer ~1.5x (comfortable surplus)
+      - D-rated banks: buffer ~1.05x (barely solvent)
+    """
+    rating_buffer = np.array([1.50, 1.30, 1.15, 1.05])[np.clip(labels, 0, 3)]
+
+    if adj_sparse is not None:
+        liabilities = np.array(adj_sparse.sum(axis=1)).flatten()
+        # Nodes with zero liabilities get a baseline
+        liabilities = np.maximum(liabilities, 1.0)
+        assets = rating_buffer * liabilities
+        # Add noise (±10%)
+        noise = rng.uniform(0.9, 1.1, N).astype(np.float32)
+        assets = assets * noise
+    else:
+        # Fallback for synthetic
+        assets = rating_buffer * 100.0 + rng.exponential(10.0, N).astype(np.float32)
+
+    return assets.astype(np.float32)
+
+
+def _print_summary(scenarios):
+    rates = [s["default_rate"] for s in scenarios]
+    cont = [s["n_contagion_defaults"] / max(1, s["labels"].sum())
+            for s in scenarios]
+    print(f"\n[Scenarios] Summary:")
+    print(f"  Default rate: {min(rates):.2%} – {max(rates):.2%}")
+    print(f"  Contagion fraction: {np.mean(cont):.1%} avg")
+    print(f"  Contagion defaults: "
+          f"{np.mean([s['n_contagion_defaults'] for s in scenarios]):.0f} avg/scenario")
+
+
+
+
+
+
+
+
+
+
+evaluation/metrics.py:
+"""
+Evaluation metrics.
+
+Classification: AUROC, AUPRC, Brier score, F1, Precision@k.
+Cascade:        Spearman ρ, MAE (raw + log1p).
+"""
+
+import numpy as np
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    brier_score_loss,
+    f1_score,
+    mean_absolute_error,
+)
+from scipy.stats import spearmanr
+from typing import Dict
+
+
+def classification_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    k: float = 0.10,
+) -> Dict[str, float]:
+    """
+    Compute classification metrics for default prediction.
+
+    Args:
+        y_true: binary labels (N,)
+        y_prob: predicted probabilities (N,)
+        k: fraction for Precision@k
+
+    Returns:
+        Dict with auroc, auprc, brier, f1, precision_at_k
+    """
+    if len(np.unique(y_true)) < 2:
+        return {
+            "auroc": 0.0, "auprc": 0.0, "brier": 1.0,
+            "f1": 0.0, "precision_at_k": 0.0,
+        }
+
+    y_pred = (y_prob > 0.5).astype(int)
+
+    return {
+        "auroc": float(roc_auc_score(y_true, y_prob)),
+        "auprc": float(average_precision_score(y_true, y_prob)),
+        "brier": float(brier_score_loss(y_true, y_prob)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "precision_at_k": float(_precision_at_k(y_true, y_prob, k)),
+    }
+
+
+def cascade_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> Dict[str, float]:
+    """
+    Compute cascade size prediction metrics.
+
+    Args:
+        y_true: true cascade sizes (N,)
+        y_pred: predicted cascade sizes (N,)
+
+    Returns:
+        Dict with spearman_rho, mae_log, mae_raw
+    """
+    if y_true.std() < 1e-8 or y_pred.std() < 1e-8:
+        return {"spearman_rho": 0.0, "mae_log": float("inf"), "mae_raw": float("inf")}
+
+    rho, _ = spearmanr(y_true, y_pred)
+    mae_log = mean_absolute_error(np.log1p(y_true), np.log1p(np.clip(y_pred, 0, None)))
+    mae_raw = mean_absolute_error(y_true, y_pred)
+
+    return {
+        "spearman_rho": float(rho),
+        "mae_log": float(mae_log),
+        "mae_raw": float(mae_raw),
+    }
+
+
+def _precision_at_k(y_true, scores, k=0.10):
+    """Precision among top-k% scored nodes."""
+    n = max(1, int(len(y_true) * k))
+    top_idx = np.argsort(scores)[-n:]
+    return float(y_true[top_idx].mean())
+
+
+
+
+evaluation/runner.py:
+"""
+Evaluation runner — executes all baselines (B1–B6) on test scenarios.
+
+Fix: all models are evaluated on the SAME test split.
+XGBoost baselines train on train scenarios, not on a subset of test.
+"""
+
+import numpy as np
+import torch
+import xgboost as xgb
+from typing import Dict, List, Tuple
+
+from config import Config
+from .metrics import classification_metrics, cascade_metrics
+
+
+class EvaluationRunner:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def run_all(
+        self,
+        node_features: np.ndarray,
+        network_features: np.ndarray,
+        cascadenet_model,
+        b3_model,
+        b4_model,
+        data,
+        sc_train: List[Dict],
+        sc_test: List[Dict],
+    ) -> Tuple[List[Dict], Dict]:
+        """
+        Run B1-B6 baselines and CascadeNet on test scenarios.
+
+        Returns:
+            (results_list, cascade_metrics_dict)
+        """
+        dev = self.cfg.device
+        N = node_features.shape[0]
+        results = []
+
+        # ── Prepare XGBoost data (from train + test scenarios) ───
+        X_train, y_train, X_test, y_test = self._prepare_xgb_data(
+            node_features, network_features, sc_train, sc_test,
+        )
+
+        # ── B1: XGBoost (node features only) ────────────────────
+        results.append(self._run_xgb(
+            X_train["nodes"], y_train,
+            X_test["nodes"], y_test,
+            "B1: XGBoost (nodes)",
+        ))
+
+        # ── B2: XGBoost + network features ──────────────────────
+        results.append(self._run_xgb(
+            X_train["nodes_net"], y_train,
+            X_test["nodes_net"], y_test,
+            "B2: XGBoost + NetFeats",
+        ))
+
+        # ── B3: VanillaGNN ──────────────────────────────────────
+        b3_probs = self._predict_gnn(b3_model, data, sc_test, dev)
+        results.append(self._eval_probs(b3_probs, y_test, "B3: VanillaGNN"))
+
+        # ── B4: StressSkipGNN ───────────────────────────────────
+        b4_probs = self._predict_gnn(b4_model, data, sc_test, dev)
+        results.append(self._eval_probs(b4_probs, y_test, "B4: StressSkipGNN"))
+
+        # ── B5: CascadeNet (full) ───────────────────────────────
+        b5_probs, cascade_preds = self._predict_cascadenet(
+            cascadenet_model, data, sc_test, dev,
+        )
+        results.append(self._eval_probs(b5_probs, y_test, "B5: CascadeNet"))
+
+        # ── B6: GNN Embeddings + XGBoost ────────────────────────
+        embs_train = self._extract_embeddings(cascadenet_model, data, sc_train, dev)
+        embs_test = self._extract_embeddings(cascadenet_model, data, sc_test, dev)
+
+        X_b6_train = np.hstack([X_train["nodes_net"], embs_train])
+        X_b6_test = np.hstack([X_test["nodes_net"], embs_test])
+        results.append(self._run_xgb(
+            X_b6_train, y_train, X_b6_test, y_test,
+            "B6: GNN Emb + XGBoost",
+        ))
+
+        # ── Cascade metrics (B5 only) ───────────────────────────
+        cas_true = np.concatenate([s["cascade_sizes"] for s in sc_test])
+        cas_met = cascade_metrics(cas_true, cascade_preds)
+
+        self._print_results(results, cas_met)
+        return results, cas_met, cascade_preds
+
+    # ═══════════════════════════════════════════════════════════════
+    # XGBoost helpers
+    # ═══════════════════════════════════════════════════════════════
+
+    def _prepare_xgb_data(self, node_features, net_features, sc_train, sc_test):
+        """Prepare tiled feature matrices for XGBoost."""
+        N = node_features.shape[0]
+
+        def _tile(scenarios):
+            n_sc = len(scenarios)
+            X_nodes = np.tile(node_features, (n_sc, 1))
+            X_net = np.tile(net_features, (n_sc, 1))
+            X_stress = np.concatenate([
+                np.tile(s["stress"], (N, 1)) for s in scenarios
+            ])
+            y = np.concatenate([s["labels"] for s in scenarios])
+            return {
+                "nodes": np.hstack([X_nodes, X_stress]),
+                "nodes_net": np.hstack([X_nodes, X_net, X_stress]),
+            }, y
+
+        X_train, y_train = _tile(sc_train)
+        X_test, y_test = _tile(sc_test)
+        return X_train, y_train, X_test, y_test
+
+    def _run_xgb(self, X_tr, y_tr, X_te, y_te, name) -> Dict:
+        """Train XGBoost on train data, evaluate on test."""
+        cfg = self.cfg
+        scale = max(1, (y_tr == 0).sum() / max((y_tr == 1).sum(), 1))
+        clf = xgb.XGBClassifier(
+            n_estimators=cfg.xgb_n_estimators,
+            max_depth=cfg.xgb_max_depth,
+            learning_rate=cfg.xgb_lr,
+            scale_pos_weight=float(scale),
+            eval_metric="logloss",
+            random_state=cfg.seed,
+            verbosity=0,
+        )
+        clf.fit(X_tr, y_tr)
+        probs = clf.predict_proba(X_te)[:, 1]
+
+        metrics = classification_metrics(y_te, probs, cfg.precision_at_k)
+        metrics["name"] = name
+        return metrics
+
+    # ═══════════════════════════════════════════════════════════════
+    # GNN prediction helpers
+    # ═══════════════════════════════════════════════════════════════
+
+    def _predict_gnn(self, model, data, scenarios, dev) -> np.ndarray:
+        """Predict default probabilities from a baseline GNN."""
+        model.eval()
+        all_probs = []
+        with torch.no_grad():
+            for sc in scenarios:
+                x = data.x.to(dev)
+                ei = data.edge_index.to(dev)
+                ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+                s = torch.tensor(sc["stress"], device=dev)
+                logit = model(x, ei, ew, s)
+                all_probs.append(torch.sigmoid(logit).cpu().numpy())
+        return np.concatenate(all_probs)
+
+    def _predict_cascadenet(self, model, data, scenarios, dev):
+        """Predict PD and cascade sizes from CascadeNet."""
+        model.eval()
+        all_pd, all_cas = [], []
+        with torch.no_grad():
+            for sc in scenarios:
+                x = data.x.to(dev)
+                ei = data.edge_index.to(dev)
+                ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+                s = torch.tensor(sc["stress"], device=dev)
+
+                pl, cg, cs = model(x, ei, ew, s)
+                all_pd.append(torch.sigmoid(pl).cpu().numpy())
+
+                # Cascade prediction = gate_prob × expm1(magnitude)
+                gate_prob = torch.sigmoid(cg)
+                raw_size = torch.expm1(cs).clamp(min=0)
+                all_cas.append((gate_prob * raw_size).cpu().numpy())
+
+        return np.concatenate(all_pd), np.concatenate(all_cas)
+
+    def _extract_embeddings(self, model, data, scenarios, dev) -> np.ndarray:
+        """Extract GNN embeddings for hybrid baseline."""
+        all_embs = []
+        with torch.no_grad():
+            for sc in scenarios:
+                x = data.x.to(dev)
+                ei = data.edge_index.to(dev)
+                ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+                s = torch.tensor(sc["stress"], device=dev)
+                emb = model.get_embeddings(x, ei, ew, s)
+                all_embs.append(emb.cpu().numpy())
+        return np.concatenate(all_embs)
+
+    def _eval_probs(self, probs, y_true, name) -> Dict:
+        """Evaluate probabilities against ground truth."""
+        metrics = classification_metrics(y_true, probs, self.cfg.precision_at_k)
+        metrics["name"] = name
+        return metrics
+
+    # ═══════════════════════════════════════════════════════════════
+    # Reporting
+    # ═══════════════════════════════════════════════════════════════
+
+    def _print_results(self, results, cas_met):
+        print("\n" + "=" * 76)
+        print("  CascadeNet — Evaluation Results")
+        print("=" * 76)
+
+        print(f"\n  {'Model':<30s} {'AUROC':>8s} {'AUPRC':>8s} "
+              f"{'Brier':>8s} {'F1':>8s}")
+        print(f"  {'─' * 66}")
+
+        for r in results:
+            tag = " ◀" if "CascadeNet" in r["name"] else ""
+            print(f"  {r['name']:<30s} {r['auroc']:>7.4f} "
+                  f"{r['auprc']:>7.4f} {r['brier']:>7.4f} "
+                  f"{r['f1']:>7.4f}{tag}")
+
+        print(f"\n  Cascade prediction:")
+        print(f"    Spearman ρ:  {cas_met['spearman_rho']:.4f}")
+        print(f"    MAE log1p:   {cas_met['mae_log']:.4f}")
+        print(f"    MAE raw:     {cas_met['mae_raw']:.1f}")
+
+        # Ablation verdicts
+        b = {r["name"][:2]: r for r in results}
+        pairs = [
+            ("B2", "B1", "Graph value"),
+            ("B5", "B2", "GNN value"),
+            ("B5", "B3", "FiLM value"),
+            ("B5", "B4", "Skip value"),
+            ("B6", "B5", "Hybrid value"),
+        ]
+
+        print(f"\n  Ablation:")
+        for hi, lo, label in pairs:
+            if hi in b and lo in b:
+                d = b[hi]["auroc"] - b[lo]["auroc"]
+                verdict = "✓" if d > 0.005 else ("~" if d > 0 else "✗")
+                print(f"    {label:<16s} ({hi}-{lo}): {d:>+.4f} AUROC  {verdict}")
+
+
+
+
+evaluation/visualization.py:
+"""
+4-panel results visualization.
+
+Panel 1: AUROC + AUPRC bar chart (all baselines)
+Panel 2: Training curves (loss + cascade weight)
+Panel 3: Contagion breakdown per test scenario
+Panel 4: Cascade prediction scatter (true vs predicted)
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from typing import Dict, List
+
+
+def plot_results(
+    results: List[Dict],
+    cascade_met: Dict,
+    train_history: Dict,
+    scenarios_test: List[Dict],
+    cascade_preds: np.ndarray,
+    save_path: str = "cascadenet_results.png",
+):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("CascadeNet — Results Overview", fontsize=16, fontweight="bold")
+
+    _plot_bar_chart(axes[0, 0], results)
+    _plot_training_curves(axes[0, 1], train_history)
+    _plot_contagion(axes[1, 0], scenarios_test)
+    _plot_cascade_scatter(axes[1, 1], scenarios_test, cascade_preds, cascade_met)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\n  [Viz] Saved to {save_path}")
+    plt.close()
+
+
+def _plot_bar_chart(ax, results):
+    names = [r["name"].replace(": ", "\n") for r in results]
+    aurocs = [r["auroc"] for r in results]
+    auprcs = [r.get("auprc", 0) for r in results]
+
+    x = np.arange(len(names))
+    w = 0.35
+
+    bars1 = ax.bar(x - w/2, aurocs, w, label="AUROC", color="#2563eb", alpha=0.85)
+    bars2 = ax.bar(x + w/2, auprcs, w, label="AUPRC", color="#7c3aed", alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, fontsize=7, ha="center")
+    ax.set_ylabel("Score")
+    ax.set_title("Head A: Default Prediction")
+    ax.legend(fontsize=8)
+
+    lo = min(min(aurocs), min(auprcs)) - 0.05
+    ax.set_ylim(max(0, lo), 1.02)
+
+    for bar, val in zip(bars1, aurocs):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+
+
+def _plot_training_curves(ax, history):
+    if not history["train_loss"]:
+        ax.text(0.5, 0.5, "No training history", ha="center", va="center")
+        return
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+    ax.plot(epochs, history["train_loss"], "b-", alpha=0.7, label="Train")
+    ax.plot(epochs, history["val_loss"], "r-", alpha=0.7, label="Val")
+
+    ax2 = ax.twinx()
+    ax2.plot(epochs, history["cascade_weight"], "g--", alpha=0.5, label="CW")
+    ax2.set_ylabel("Cascade Weight", color="green", fontsize=9)
+    ax2.tick_params(axis="y", labelcolor="green")
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training Curves")
+    ax.legend(loc="upper right", fontsize=8)
+    ax2.legend(loc="center right", fontsize=8)
+
+
+def _plot_contagion(ax, scenarios):
+    n_sc = len(scenarios)
+    idx = range(n_sc)
+    init = [s["n_initial_defaults"] for s in scenarios]
+    cont = [s["n_contagion_defaults"] for s in scenarios]
+
+    ax.bar(idx, init, color="#94a3b8", label="Fundamental")
+    ax.bar(idx, cont, bottom=init, color="#ef4444", label="Contagion")
+
+    ax.set_xlabel("Test Scenario")
+    ax.set_ylabel("# Defaults")
+    ax.set_title("Contagion Breakdown")
+    ax.legend(fontsize=9)
+
+
+def _plot_cascade_scatter(ax, scenarios, preds, metrics):
+    all_true = np.concatenate([s["cascade_sizes"] for s in scenarios])
+
+    # Plot nodes with nonzero cascade
+    nonzero = all_true > 0
+    n_pts = min(3000, nonzero.sum())
+    if n_pts > 0:
+        idx = np.random.choice(np.where(nonzero)[0], n_pts, replace=False)
+        ax.scatter(
+            np.log1p(all_true[idx]),
+            np.log1p(preds[idx]),
+            alpha=0.2, s=10, color="#2563eb",
+        )
+        lim = max(np.log1p(all_true[idx]).max(), np.log1p(preds[idx]).max())
+        ax.plot([0, lim], [0, lim], "r--", alpha=0.5, label="Perfect")
+
+    rho = metrics["spearman_rho"]
+    ax.set_xlabel("True cascade (log1p)")
+    ax.set_ylabel("Predicted cascade (log1p)")
+    ax.set_title(f"Head B: Cascade (ρ={rho:.3f})")
+    ax.legend(fontsize=9)
+
+
+
+
+models/baselines.py:
+"""
+GNN baselines for ablation study.
+
+B3: VanillaGNN — stress concatenated to input, no conditioning after that.
+B4: StressSkipGNN — stress injected at every layer via skip connections.
+
+Both use the same depth/width as CascadeNet for fair comparison.
+"""
+
+import torch
+import torch.nn as nn
+
+from config import Config
+from .gnn_layers import VanillaGNNLayer, StressSkipGNNLayer
+
+
+class VanillaGNN(nn.Module):
+    """
+    B3 baseline: GNN with stress concatenated to node features at input.
+    No FiLM, no per-layer stress injection.
+
+    Isolates: does the GNN need stress at all beyond the input?
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.input_proj = nn.Linear(cfg.input_dim + cfg.stress_dim, cfg.hidden_dim)
+
+        self.gnn_layers = nn.ModuleList([
+            VanillaGNNLayer(cfg.hidden_dim, cfg.dropout)
+            for _ in range(cfg.num_gnn_layers)
+        ])
+
+        self.pd_head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.head_hidden),
+            nn.LayerNorm(cfg.head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(cfg.head_hidden, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x, edge_index, edge_weight, stress):
+        if stress.dim() == 1:
+            stress = stress.unsqueeze(0)
+        s = stress.expand(x.size(0), -1)
+
+        h = self.input_proj(torch.cat([x, s], dim=-1))
+        for layer in self.gnn_layers:
+            h = layer(h, edge_index, edge_weight)
+
+        return self.pd_head(h).squeeze(-1)
+
+    def count_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class StressSkipGNN(nn.Module):
+    """
+    B4 baseline: GNN with stress concatenated at input AND every layer.
+    Stress has full access throughout, but via concatenation not FiLM.
+
+    Isolates: is FiLM (multiplicative) better than additive skip access?
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.input_proj = nn.Linear(cfg.input_dim + cfg.stress_dim, cfg.hidden_dim)
+
+        self.gnn_layers = nn.ModuleList([
+            StressSkipGNNLayer(cfg.hidden_dim, cfg.stress_dim, cfg.dropout)
+            for _ in range(cfg.num_gnn_layers)
+        ])
+
+        self.pd_head = nn.Sequential(
+            nn.Linear(cfg.hidden_dim, cfg.head_hidden),
+            nn.LayerNorm(cfg.head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(cfg.head_hidden, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x, edge_index, edge_weight, stress):
+        if stress.dim() == 1:
+            stress = stress.unsqueeze(0)
+        s = stress.expand(x.size(0), -1)
+
+        h = self.input_proj(torch.cat([x, s], dim=-1))
+        for layer in self.gnn_layers:
+            h = layer(h, edge_index, edge_weight, stress)
+
+        return self.pd_head(h).squeeze(-1)
+
+    def count_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+
+
+models/cascadenet.py:
+"""
+CascadeNet — Stress-Conditioned Cascade Risk Predictor.
+
+Full model: StressEncoder → FiLM-conditioned GNN → DualHead.
+"""
+
+import torch
+import torch.nn as nn
+from typing import Tuple
+
+from config import Config
+from .stress_encoder import StressEncoder
+from .gnn_layers import StressCondGNNLayer
+from .heads import DualHead
+
+
+class CascadeNet(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+
+        self.input_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+
+        self.stress_enc = StressEncoder(
+            stress_dim=cfg.stress_dim,
+            emb_dim=cfg.stress_emb_dim,
+            gamma_min=cfg.gamma_min,
+            gamma_max=cfg.gamma_max,
+        )
+
+        self.gnn_layers = nn.ModuleList([
+            StressCondGNNLayer(cfg.hidden_dim, cfg.stress_emb_dim, cfg.dropout)
+            for _ in range(cfg.num_gnn_layers)
+        ])
+
+        self.dual_head = DualHead(
+            h_dim=cfg.hidden_dim,
+            stress_emb_dim=cfg.stress_emb_dim,
+            head_hidden=cfg.head_hidden,
+        )
+
+    def forward(
+        self, x, edge_index, edge_weight, stress,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x:           (N, input_dim)
+            edge_index:  (2, E)
+            edge_weight: (E,) or None
+            stress:      (1, stress_dim) or (stress_dim,)
+
+        Returns:
+            pd_logit:     (N,)
+            cascade_gate: (N,)
+            cascade_size: (N,)
+        """
+        gamma, beta = self.stress_enc(stress)
+        h = self.input_proj(x)
+
+        for layer in self.gnn_layers:
+            h = layer(h, edge_index, edge_weight, gamma, beta)
+
+        return self.dual_head(h, gamma, beta)
+
+    def get_embeddings(self, x, edge_index, edge_weight, stress) -> torch.Tensor:
+        """Extract node embeddings (for hybrid B6 baseline)."""
+        gamma, beta = self.stress_enc(stress)
+        h = self.input_proj(x)
+        for layer in self.gnn_layers:
+            h = layer(h, edge_index, edge_weight, gamma, beta)
+        return h.detach()
+
+    def count_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+
+
+
+
+
+models/gnn_layers.py:
+"""
+GNN message-passing layers.
+
+StressCondGNNLayer — FiLM-conditioned (for CascadeNet)
+VanillaGNNLayer   — no stress conditioning (for B3 baseline)
+StressSkipGNNLayer — stress concatenated at every layer (for B4 baseline)
+
+Fix: StressCondGNNLayer no longer passes both raw `agg` and `sa` to the
+update MLP — only [h, sa] — removing the "escape hatch" from FiLM.
+"""
+
+import torch
+import torch.nn as nn
+from torch_geometric.nn import MessagePassing
+
+
+class StressCondGNNLayer(MessagePassing):
+    """
+    GNN layer with FiLM stress conditioning on aggregated messages.
+
+    Update: h' = MLP([h, γ·agg + β]) + h
+    """
+
+    def __init__(self, h_dim: int, stress_emb_dim: int, dropout: float = 0.1):
+        super().__init__(aggr="add")
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.GELU(),
+        )
+        self.stress_proj = (
+            nn.Linear(stress_emb_dim, h_dim)
+            if stress_emb_dim != h_dim
+            else nn.Identity()
+        )
+        # Only [h, stress_modulated_agg] — no raw agg
+        self.upd_mlp = nn.Sequential(
+            nn.Linear(h_dim * 2, h_dim),
+            nn.LayerNorm(h_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, h, edge_index, edge_weight, gamma, beta):
+        agg = self.propagate(edge_index, x=h, edge_weight=edge_weight)
+
+        g = self.stress_proj(gamma)
+        b = self.stress_proj(beta)
+        if g.dim() == 2 and g.size(0) == 1:
+            g = g.expand(h.size(0), -1)
+            b = b.expand(h.size(0), -1)
+
+        # FiLM modulation
+        sa = g * agg + b
+
+        return self.upd_mlp(torch.cat([h, sa], dim=-1)) + h
+
+    def message(self, x_j, edge_weight):
+        m = self.msg_mlp(x_j)
+        if edge_weight is not None:
+            return m * edge_weight.unsqueeze(-1)
+        return m
+
+
+class VanillaGNNLayer(MessagePassing):
+    """Standard GNN layer — no stress conditioning at all."""
+
+    def __init__(self, h_dim: int, dropout: float = 0.1):
+        super().__init__(aggr="add")
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.GELU(),
+        )
+        self.upd_mlp = nn.Sequential(
+            nn.Linear(h_dim * 2, h_dim),
+            nn.LayerNorm(h_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, h, edge_index, edge_weight):
+        agg = self.propagate(edge_index, x=h, edge_weight=edge_weight)
+        return self.upd_mlp(torch.cat([h, agg], dim=-1)) + h
+
+    def message(self, x_j, edge_weight):
+        m = self.msg_mlp(x_j)
+        if edge_weight is not None:
+            return m * edge_weight.unsqueeze(-1)
+        return m
+
+
+class StressSkipGNNLayer(MessagePassing):
+    """
+    GNN layer with stress vector injected via skip connection.
+
+    B4 baseline: stress is concatenated (not FiLM-multiplied) at
+    every layer, giving it repeated access without multiplicative
+    modulation. This isolates FiLM's contribution vs simple availability.
+    """
+
+    def __init__(self, h_dim: int, stress_dim: int, dropout: float = 0.1):
+        super().__init__(aggr="add")
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(h_dim, h_dim),
+            nn.GELU(),
+        )
+        # h + agg + stress → h
+        self.upd_mlp = nn.Sequential(
+            nn.Linear(h_dim * 2 + stress_dim, h_dim),
+            nn.LayerNorm(h_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, h, edge_index, edge_weight, stress):
+        agg = self.propagate(edge_index, x=h, edge_weight=edge_weight)
+
+        # Expand stress to all nodes
+        s = stress.expand(h.size(0), -1) if stress.dim() == 2 else stress.unsqueeze(0).expand(h.size(0), -1)
+
+        return self.upd_mlp(torch.cat([h, agg, s], dim=-1)) + h
+
+    def message(self, x_j, edge_weight):
+        m = self.msg_mlp(x_j)
+        if edge_weight is not None:
+            return m * edge_weight.unsqueeze(-1)
+        return m
+
+
+
+
+
+models/heads.py:
+"""
+Prediction heads for CascadeNet.
+
+DualHead:
+  - Head A: default probability (binary classification logit)
+  - Head B: cascade size = gate × magnitude
+    - gate:      P(cascade > 0)
+    - magnitude: expected cascade size (Softplus)
+
+Fix: stress input is [γ, β] concatenated (not averaged), preserving
+both scale and shift information with their distinct semantics.
+"""
+
+import torch
+import torch.nn as nn
+
+
+class DualHead(nn.Module):
+    """
+    Two-headed prediction from node embeddings + stress parameters.
+
+    Inputs:
+        h:     (N, h_dim)          — node embeddings from GNN
+        gamma: (1, stress_emb_dim) — FiLM scale parameter
+        beta:  (1, stress_emb_dim) — FiLM shift parameter
+
+    Outputs:
+        pd_logit:      (N,) — default probability logit
+        cascade_gate:  (N,) — cascade occurrence logit
+        cascade_size:  (N,) — expected cascade magnitude (>0)
+    """
+
+    def __init__(
+        self,
+        h_dim: int = 64,
+        stress_emb_dim: int = 32,
+        head_hidden: int = 128,
+    ):
+        super().__init__()
+        # Concatenate [γ, β] → 2 × stress_emb_dim
+        stress_input = stress_emb_dim * 2
+        inp = h_dim + stress_input
+
+        self.stress_compress = nn.Sequential(
+            nn.Linear(stress_input, stress_emb_dim),
+            nn.GELU(),
+        )
+
+        inp_compressed = h_dim + stress_emb_dim
+
+        self.pd_head = nn.Sequential(
+            nn.Linear(inp_compressed, head_hidden),
+            nn.LayerNorm(head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+        self.cascade_gate = nn.Sequential(
+            nn.Linear(inp_compressed, head_hidden),
+            nn.LayerNorm(head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+        self.cascade_magnitude = nn.Sequential(
+            nn.Linear(inp_compressed, head_hidden),
+            nn.LayerNorm(head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+            nn.Softplus(),
+        )
+
+    def forward(self, h, gamma, beta):
+        # Concatenate γ and β, then compress
+        stress_cat = torch.cat([gamma, beta], dim=-1)  # (1, 2·emb)
+        stress_repr = self.stress_compress(stress_cat)  # (1, emb)
+        stress_repr = stress_repr.expand(h.size(0), -1)
+
+        inp = torch.cat([h, stress_repr], dim=-1)
+
+        pd = self.pd_head(inp).squeeze(-1)
+        gate = self.cascade_gate(inp).squeeze(-1)
+        mag = self.cascade_magnitude(inp).squeeze(-1) + 1e-6
+
+        return pd, gate, mag
+
+
+
+
+models/stress_encoder.py:
+"""
+FiLM Stress Encoder — generates γ (scale) and β (shift) vectors
+from a macro-stress input for conditioning GNN message passing.
+
+Fix: γ range is (gamma_min, gamma_max) via scaled sigmoid, allowing
+both attenuation AND amplification of signals under stress.
+"""
+
+import torch
+import torch.nn as nn
+
+
+class StressEncoder(nn.Module):
+    """
+    Maps a stress vector s ∈ R^stress_dim to FiLM parameters (γ, β).
+
+    γ ∈ (gamma_min, gamma_max) — multiplicative modulation
+    β ∈ (-1, 1)                — additive shift
+    """
+
+    def __init__(
+        self,
+        stress_dim: int = 8,
+        emb_dim: int = 32,
+        gamma_min: float = 0.5,
+        gamma_max: float = 2.0,
+    ):
+        super().__init__()
+        self.gamma_min = gamma_min
+        self.gamma_range = gamma_max - gamma_min
+
+        self.shared = nn.Sequential(
+            nn.Linear(stress_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+        )
+        self.gamma_head = nn.Sequential(
+            nn.Linear(64, emb_dim),
+            nn.Sigmoid(),  # output ∈ (0, 1), rescaled in forward
+        )
+        self.beta_head = nn.Sequential(
+            nn.Linear(64, emb_dim),
+            nn.Tanh(),
+        )
+
+    def forward(self, s: torch.Tensor):
+        """
+        Args:
+            s: stress vector (1, stress_dim) or (stress_dim,)
+
+        Returns:
+            gamma: (1, emb_dim) — scale factors in (gamma_min, gamma_max)
+            beta:  (1, emb_dim) — shift in (-1, 1)
+        """
+        if s.dim() == 1:
+            s = s.unsqueeze(0)
+
+        h = self.shared(s)
+        gamma = self.gamma_min + self.gamma_range * self.gamma_head(h)
+        beta = self.beta_head(h)
+        return gamma, beta
+
+
+
+
+
+training/baseline_trainer.py:
+"""
+Trainer for GNN baselines (B3: VanillaGNN, B4: StressSkipGNN).
+
+Simplified: classification only (no cascade head).
+Same LR schedule and early stopping as CascadeNet for fairness.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from typing import List, Dict
+
+from config import Config
+from .loss import compute_pos_weight
+
+
+class BaselineGNNTrainer:
+    def __init__(self, model: nn.Module, cfg: Config, name: str = "Baseline"):
+        self.model = model.to(cfg.device)
+        self.cfg = cfg
+        self.name = name
+        self.optimizer = AdamW(
+            model.parameters(),
+            lr=cfg.baseline_lr,
+            weight_decay=cfg.weight_decay,
+        )
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=cfg.baseline_epochs, eta_min=1e-5,
+        )
+        self.best_val_loss = float("inf")
+        self.patience_counter = 0
+        self.best_state = None
+
+    def train_epoch(self, data, scenarios: List[Dict]) -> float:
+        self.model.train()
+        dev = self.cfg.device
+        total, n = 0.0, 0
+
+        for sc in scenarios:
+            x = data.x.to(dev)
+            ei = data.edge_index.to(dev)
+            ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+            s = torch.tensor(sc["stress"], device=dev)
+            y = torch.tensor(sc["labels"], device=dev)
+            pw = compute_pos_weight(sc["labels"])
+
+            self.optimizer.zero_grad()
+            logit = self.model(x, ei, ew, s)
+            loss = F.binary_cross_entropy_with_logits(
+                logit, y, pos_weight=torch.tensor([pw], device=dev),
+            )
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+
+            total += loss.item()
+            n += 1
+
+        self.scheduler.step()
+        return total / max(n, 1)
+
+    @torch.no_grad()
+    def validate(self, data, scenarios: List[Dict]) -> float:
+        self.model.eval()
+        dev = self.cfg.device
+        total, n = 0.0, 0
+
+        for sc in scenarios:
+            x = data.x.to(dev)
+            ei = data.edge_index.to(dev)
+            ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+            s = torch.tensor(sc["stress"], device=dev)
+            y = torch.tensor(sc["labels"], device=dev)
+            pw = compute_pos_weight(sc["labels"])
+
+            logit = self.model(x, ei, ew, s)
+            loss = F.binary_cross_entropy_with_logits(
+                logit, y, pos_weight=torch.tensor([pw], device=dev),
+            )
+            total += loss.item()
+            n += 1
+
+        return total / max(n, 1)
+
+    def fit(self, data, sc_train: List[Dict], sc_val: List[Dict]) -> nn.Module:
+        cfg = self.cfg
+        print(f"\n  [{self.name}] Training ({self.model.count_params():,} params)...")
+
+        for ep in range(1, cfg.baseline_epochs + 1):
+            np.random.shuffle(sc_train)
+            tl = self.train_epoch(data, sc_train)
+            vl = self.validate(data, sc_val)
+
+            if ep % 10 == 0:
+                print(f"    {self.name} Epoch {ep:3d}/{cfg.baseline_epochs} │ "
+                      f"Train: {tl:.4f} │ Val: {vl:.4f}")
+
+            if vl < self.best_val_loss:
+                self.best_val_loss = vl
+                self.patience_counter = 0
+                self.best_state = {
+                    k: v.cpu().clone()
+                    for k, v in self.model.state_dict().items()
+                }
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= cfg.baseline_patience:
+                    print(f"    {self.name} early stopping at epoch {ep}")
+                    break
+
+        if self.best_state:
+            self.model.load_state_dict(self.best_state)
+            self.model.to(cfg.device)
+
+        print(f"  [{self.name}] Best val loss: {self.best_val_loss:.4f}")
+        return self.model
+
+
+
+
+
+
+
+training/loss.py:
+"""
+Multi-task loss for CascadeNet.
+
+L = L_pd + cascade_weight × (L_gate + L_cascade)
+
+  L_pd:      weighted BCE for default classification
+  L_gate:    BCE for cascade occurrence (cascade > 0?)
+  L_cascade: Huber loss on log1p(cascade_size) for nonzero cascades
+"""
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+def cascadenet_loss(
+    pd_logit: torch.Tensor,
+    cascade_gate: torch.Tensor,
+    cascade_size: torch.Tensor,
+    y_true: torch.Tensor,
+    cascade_true: torch.Tensor,
+    pos_weight: float,
+    cascade_weight: float = 0.3,
+) -> torch.Tensor:
+    """
+    Compute combined loss for default prediction and cascade estimation.
+
+    Args:
+        pd_logit:      (N,) default logits
+        cascade_gate:  (N,) cascade occurrence logits
+        cascade_size:  (N,) predicted cascade magnitude
+        y_true:        (N,) binary default labels
+        cascade_true:  (N,) true cascade sizes
+        pos_weight:    class weight for positive (default) class
+        cascade_weight: weight of cascade loss terms (staged)
+
+    Returns:
+        Scalar loss
+    """
+    dev = y_true.device
+    pw = torch.tensor([pos_weight], device=dev)
+
+    # Head A: default prediction
+    L_pd = F.binary_cross_entropy_with_logits(pd_logit, y_true, pos_weight=pw)
+
+    # Head B: cascade estimation
+    cascade_occurred = (cascade_true > 0).float()
+    L_gate = F.binary_cross_entropy_with_logits(cascade_gate, cascade_occurred)
+
+    mask = cascade_true > 0
+    if mask.sum() > 0:
+        L_cascade = F.huber_loss(
+            cascade_size[mask],
+            torch.log1p(cascade_true[mask]),
+            delta=2.0,
+        )
+    else:
+        L_cascade = torch.tensor(0.0, device=dev)
+
+    return L_pd + cascade_weight * (L_gate + L_cascade)
+
+
+def compute_pos_weight(labels: np.ndarray, lo: float = 1.0, hi: float = 20.0) -> float:
+    """
+    Compute class weight for imbalanced binary classification.
+    Clipped to [lo, hi] for stability.
+    """
+    p = labels.mean()
+    if 0 < p < 1:
+        return float(np.clip((1 - p) / p, lo, hi))
+    return 1.0
+
+
+
+
+
+
+training/trainer.py:
+"""
+CascadeNet trainer with:
+  - Gradient accumulation over multiple scenarios
+  - Staged cascade weight schedule
+  - Cosine annealing LR
+  - Training history for visualization
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from typing import Dict, List, Tuple
+
+from config import Config
+from .loss import cascadenet_loss, compute_pos_weight
+
+
+class CascadeNetTrainer:
+    def __init__(self, model: nn.Module, cfg: Config):
+        self.model = model.to(cfg.device)
+        self.cfg = cfg
+        self.optimizer = AdamW(
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+        )
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=cfg.epochs, eta_min=1e-5,
+        )
+        self.best_val_loss = float("inf")
+        self.patience_counter = 0
+        self.best_state = None
+        self.history = {
+            "train_loss": [],
+            "val_loss": [],
+            "cascade_weight": [],
+        }
+
+    def _cascade_weight(self, epoch: int) -> float:
+        """Linear ramp from cascade_weight_start → cascade_weight_end."""
+        t = min(1.0, epoch / self.cfg.epochs)
+        s, e = self.cfg.cascade_weight_start, self.cfg.cascade_weight_end
+        return s + (e - s) * t
+
+    def train_epoch(self, data, scenarios: List[Dict], epoch: int) -> float:
+        self.model.train()
+        dev = self.cfg.device
+        cw = self._cascade_weight(epoch)
+        accum = self.cfg.grad_accum_steps
+
+        self.optimizer.zero_grad()
+        total_loss, n_steps, n_accum = 0.0, 0, 0
+
+        for i, sc in enumerate(scenarios):
+            x = data.x.to(dev)
+            ei = data.edge_index.to(dev)
+            ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+            s = torch.tensor(sc["stress"], device=dev)
+            y = torch.tensor(sc["labels"], device=dev)
+            cas = torch.tensor(sc["cascade_sizes"], device=dev)
+            pw = compute_pos_weight(sc["labels"])
+
+            pl, cg, cs = self.model(x, ei, ew, s)
+            loss = cascadenet_loss(pl, cg, cs, y, cas, pw, cw)
+
+            # Scale loss for accumulation
+            (loss / accum).backward()
+            total_loss += loss.item()
+            n_steps += 1
+            n_accum += 1
+
+            if n_accum >= accum or i == len(scenarios) - 1:
+                nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.max_grad_norm,
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                n_accum = 0
+
+        self.scheduler.step()
+        return total_loss / max(n_steps, 1)
+
+    @torch.no_grad()
+    def validate(self, data, scenarios: List[Dict], epoch: int) -> float:
+        self.model.eval()
+        dev = self.cfg.device
+        cw = self._cascade_weight(epoch)
+        total, n = 0.0, 0
+
+        for sc in scenarios:
+            x = data.x.to(dev)
+            ei = data.edge_index.to(dev)
+            ew = data.edge_weight.to(dev) if data.edge_weight is not None else None
+            s = torch.tensor(sc["stress"], device=dev)
+            y = torch.tensor(sc["labels"], device=dev)
+            cas = torch.tensor(sc["cascade_sizes"], device=dev)
+            pw = compute_pos_weight(sc["labels"])
+
+            pl, cg, cs = self.model(x, ei, ew, s)
+            loss = cascadenet_loss(pl, cg, cs, y, cas, pw, cw)
+            total += loss.item()
+            n += 1
+
+        return total / max(n, 1)
+
+    def fit(
+        self, data, sc_train: List[Dict], sc_val: List[Dict],
+    ) -> nn.Module:
+        cfg = self.cfg
+        print(f"\n[CascadeNet] Training")
+        print(f"  {len(sc_train)} train / {len(sc_val)} val scenarios")
+        print(f"  Params: {self.model.count_params():,}")
+        print(f"  Device: {cfg.device}")
+        print(f"  Grad accum: {cfg.grad_accum_steps} steps")
+        print(f"  Cascade weight: {cfg.cascade_weight_start} → "
+              f"{cfg.cascade_weight_end}\n")
+
+        for ep in range(1, cfg.epochs + 1):
+            np.random.shuffle(sc_train)
+            tl = self.train_epoch(data, sc_train, ep)
+            vl = self.validate(data, sc_val, ep)
+            cw = self._cascade_weight(ep)
+
+            self.history["train_loss"].append(tl)
+            self.history["val_loss"].append(vl)
+            self.history["cascade_weight"].append(cw)
+
+            if ep % 5 == 0 or ep == 1:
+                lr = self.optimizer.param_groups[0]["lr"]
+                print(f"  Epoch {ep:3d}/{cfg.epochs} │ "
+                      f"Train: {tl:.4f} │ Val: {vl:.4f} │ "
+                      f"LR: {lr:.6f} │ CW: {cw:.3f}")
+
+            if vl < self.best_val_loss:
+                self.best_val_loss = vl
+                self.patience_counter = 0
+                self.best_state = {
+                    k: v.cpu().clone()
+                    for k, v in self.model.state_dict().items()
+                }
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= cfg.patience:
+                    print(f"\n  Early stopping at epoch {ep}")
+                    break
+
+        if self.best_state:
+            self.model.load_state_dict(self.best_state)
+            self.model.to(cfg.device)
+
+        print(f"  Best val loss: {self.best_val_loss:.4f}")
+        return self.model
+
+
+
+
+
+
+config.py:
+"""
+CascadeNet — Configuration
+All hyperparameters in one place. Override via CLI or constructor.
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+import torch
+import numpy as np
+
+
+@dataclass
+class Config:
+    # ── Data ─────────────────────────────────────────────────────────
+    data_dir: str = "./data/interbank/datasets"
+    quarter: str = "2022Q4"
+    synthetic: bool = False          # fallback: generate BA graph
+
+    # AI4Risk dataset
+    node_feature_dim: int = 70       # 70 financial features from AI4Risk
+    stress_dim: int = 8              # macro-stress vector dimensionality
+
+    # Synthetic fallback only
+    num_nodes: int = 5_000
+    ba_edges_per_node: int = 3
+    synth_feature_dim: int = 15
+
+    # ── Stress scenarios ─────────────────────────────────────────────
+    num_scenarios: int = 50
+    base_default_rate: float = 0.05  # realistic: 1-5% baseline
+    stress_max_default_rate: float = 0.25  # up to 25% under severe stress
+    lgd: float = 0.45               # loss given default (Basel standard)
+    stress_contagion_mult: float = 2.0
+    cascade_workers: int = -1        # joblib: -1 = all cores
+
+    # ── Train / val / test split ─────────────────────────────────────
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+
+    # ── Model ────────────────────────────────────────────────────────
+    hidden_dim: int = 64
+    stress_emb_dim: int = 32
+    num_gnn_layers: int = 3
+    dropout: float = 0.1
+    head_hidden: int = 128
+
+    # StressEncoder γ range — allows amplification (0.5, 2.0)
+    gamma_min: float = 0.5
+    gamma_max: float = 2.0
+
+    # ── Training ─────────────────────────────────────────────────────
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    epochs: int = 80
+    patience: int = 15
+    grad_accum_steps: int = 4        # accumulate gradients over N scenarios
+    max_grad_norm: float = 1.0
+
+    # Staged cascade weight: ramps linearly from start → end
+    cascade_weight_start: float = 0.05
+    cascade_weight_end: float = 0.3
+
+    # ── Baseline training ────────────────────────────────────────────
+    baseline_epochs: int = 80
+    baseline_lr: float = 1e-3
+    baseline_patience: int = 15
+
+    # XGBoost
+    xgb_n_estimators: int = 200
+    xgb_max_depth: int = 6
+    xgb_lr: float = 0.1
+
+    # ── Evaluation ───────────────────────────────────────────────────
+    num_seeds: int = 1               # multi-seed for confidence intervals
+    precision_at_k: float = 0.10     # top-k% for precision metric
+
+    # ── Output ───────────────────────────────────────────────────────
+    output_dir: str = "./outputs"
+    save_model: bool = True
+    plot_results: bool = True
+
+    # ── System ───────────────────────────────────────────────────────
+    seed: int = 42
+    device: str = ""                 # auto-detect if empty
+
+    def __post_init__(self):
+        if not self.device:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.set_seed(self.seed)
+
+        # In AI4Risk mode, feature dim is always 70
+        # In synthetic mode, it's synth_feature_dim
+        if self.synthetic:
+            self.node_feature_dim = self.synth_feature_dim
+
+    def set_seed(self, seed: int):
+        self.seed = seed
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    @property
+    def input_dim(self) -> int:
+        """Actual input dimension for models."""
+        return self.node_feature_dim
+
+    def for_quick_test(self) -> "Config":
+        """Return a copy configured for fast debugging."""
+        self.num_nodes = 500
+        self.num_scenarios = 10
+        self.epochs = 5
+        self.baseline_epochs = 5
+        self.patience = 3
+        self.baseline_patience = 3
+        self.grad_accum_steps = 2
+        return self
+
+
+
+
+
+
+
+
+main.py:
+"""
+CascadeNet — Full Pipeline
+
+Usage:
+    python main.py --data-dir ./data/interbank/datasets --quarter 2022Q4
+    python main.py --synthetic --quick
+    python main.py --data-dir ./data/interbank/datasets --seeds 5
+"""
+
+import os
+import argparse
+import warnings
+import json
+
+import numpy as np
+import torch
+
+warnings.filterwarnings("ignore")
+
+from config import Config
+from datapipe import load_data, generate_scenarios, split_scenarios
+from models import CascadeNet, VanillaGNN, StressSkipGNN
+from training import CascadeNetTrainer, BaselineGNNTrainer
+from evaluation import EvaluationRunner, plot_results
+
+
+def run_pipeline(cfg: Config) -> dict:
+    """Execute the full CascadeNet pipeline for a single seed."""
+
+    # ── Step 1: Load data ────────────────────────────────────────
+    print("=" * 72)
+    print("  STEP 1: Loading Data")
+    print("=" * 72)
+    dataset = load_data(cfg)
+    data = dataset["pyg_data"]
+    meta = dataset["metadata"]
+
+    print(f"\n  Source: {meta['data_source']}")
+    print(f"  Nodes: {meta['num_nodes']}, Edges: {meta['num_edges']}")
+    print(f"  Avg degree: {meta['avg_degree']:.1f}")
+
+    # ── Step 2: Generate stress scenarios ────────────────────────
+    print("\n" + "=" * 72)
+    print("  STEP 2: Generating Stress Scenarios")
+    print("=" * 72)
+    scenarios = generate_scenarios(
+        cfg,
+        node_features=dataset["node_features_raw"],
+        adj_sparse=dataset["adj_sparse"],
+        labels=dataset["labels"],
+    )
+    sc_train, sc_val, sc_test = split_scenarios(scenarios, cfg)
+
+    # ── Step 3: Train CascadeNet ─────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  STEP 3: Training CascadeNet")
+    print("=" * 72)
+    model = CascadeNet(cfg)
+    trainer = CascadeNetTrainer(model, cfg)
+    trained_model = trainer.fit(data, sc_train, sc_val)
+
+    # ── Step 4: Train B3 (VanillaGNN) ────────────────────────────
+    print("\n" + "=" * 72)
+    print("  STEP 4: Training Baselines")
+    print("=" * 72)
+
+    b3 = VanillaGNN(cfg)
+    b3_trainer = BaselineGNNTrainer(b3, cfg, name="B3-VanillaGNN")
+    trained_b3 = b3_trainer.fit(data, sc_train, sc_val)
+
+    # ── Step 5: Train B4 (StressSkipGNN) ─────────────────────────
+    b4 = StressSkipGNN(cfg)
+    b4_trainer = BaselineGNNTrainer(b4, cfg, name="B4-StressSkipGNN")
+    trained_b4 = b4_trainer.fit(data, sc_train, sc_val)
+
+    # ── Step 6: Evaluate all models ──────────────────────────────
+    print("\n" + "=" * 72)
+    print("  STEP 5: Evaluation (B1-B6)")
+    print("=" * 72)
+    runner = EvaluationRunner(cfg)
+    results, cas_met, cascade_preds = runner.run_all(
+        node_features=dataset["node_features_raw"],
+        network_features=dataset["network_features"],
+        cascadenet_model=trained_model,
+        b3_model=trained_b3,
+        b4_model=trained_b4,
+        data=data,
+        sc_train=sc_train,
+        sc_test=sc_test,
+    )
+
+    # ── Step 7: Visualize ────────────────────────────────────────
+    if cfg.plot_results:
+        print("\n" + "=" * 72)
+        print("  STEP 6: Visualization")
+        print("=" * 72)
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        fig_path = os.path.join(cfg.output_dir, "cascadenet_results.png")
+        plot_results(
+            results, cas_met, trainer.history,
+            sc_test, cascade_preds, fig_path,
+        )
+
+    # ── Step 8: Save model ───────────────────────────────────────
+    if cfg.save_model:
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        save_path = os.path.join(cfg.output_dir, "cascadenet.pt")
+        torch.save({
+            "model_state": trained_model.state_dict(),
+            "config": cfg,
+            "metadata": meta,
+        }, save_path)
+        print(f"\n  Model saved to {save_path}")
+
+    return {
+        "results": results,
+        "cascade_metrics": cas_met,
+        "metadata": meta,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CascadeNet Pipeline")
+    parser.add_argument("--data-dir", type=str, default="./data/interbank/datasets")
+    parser.add_argument("--quarter", type=str, default="2022Q4")
+    parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--output-dir", type=str, default="./outputs")
+    parser.add_argument("--device", type=str, default="")
+    args = parser.parse_args()
+
+    cfg = Config(
+        data_dir=args.data_dir,
+        quarter=args.quarter,
+        synthetic=args.synthetic,
+        output_dir=args.output_dir,
+        num_seeds=args.seeds,
+    )
+    if args.device:
+        cfg.device = args.device
+    if args.quick:
+        cfg.for_quick_test()
+        print("[Quick mode]\n")
+
+    if cfg.num_seeds == 1:
+        run_pipeline(cfg)
+    else:
+        # Multi-seed evaluation for confidence intervals
+        all_results = []
+        for seed in range(cfg.num_seeds):
+            print(f"\n{'#' * 72}")
+            print(f"  SEED {seed + 1}/{cfg.num_seeds}")
+            print(f"{'#' * 72}")
+
+            cfg.set_seed(cfg.seed + seed)
+            out = run_pipeline(cfg)
+            all_results.append(out["results"])
+
+        _print_multi_seed_summary(all_results)
+
+
+def _print_multi_seed_summary(all_results):
+    """Print mean ± std across seeds."""
+    print("\n" + "=" * 72)
+    print("  Multi-Seed Summary (mean ± std)")
+    print("=" * 72)
+
+    # Collect per-model AUROC across seeds
+    model_names = [r["name"] for r in all_results[0]]
+    for name in model_names:
+        aurocs = []
+        auprcs = []
+        for seed_results in all_results:
+            r = next(x for x in seed_results if x["name"] == name)
+            aurocs.append(r["auroc"])
+            auprcs.append(r.get("auprc", 0))
+
+        aurocs = np.array(aurocs)
+        auprcs = np.array(auprcs)
+        print(f"  {name:<30s}  AUROC: {aurocs.mean():.4f} ± {aurocs.std():.4f}  "
+              f"AUPRC: {auprcs.mean():.4f} ± {auprcs.std():.4f}")
+
+
+if __name__ == "__main__":
+    main()
+
