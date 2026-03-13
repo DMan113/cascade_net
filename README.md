@@ -79,7 +79,7 @@ Temporal pattern across 32 quarters:
 
 ## Data
 
-Uses the [AI4Risk/interbank](https://github.com/AI4Risk/interbank) dataset:
+This project uses the open-source **[AI4Risk/interbank](https://github.com/AI4Risk/interbank)** dataset:
 - **Nodes**: 4,548 banks with 70 financial features (total assets, equity, liquidity ratios, CET1, etc.) + credit ratings (A–D)
 - **Edges**: 12,461 interbank exposures with weights
 - **Quarters**: 2016Q1 – 2023Q4 (32 quarters, all evaluated independently)
