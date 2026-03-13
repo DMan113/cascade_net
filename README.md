@@ -164,7 +164,7 @@ cascade_net/
 - **Calibration (Brier score) is where GNNs consistently beat XGBoost**, even when AUROC is tied. CascadeNet won Brier in 32/32 quarters
 - **Stress must enter at input AND via FiLM** — when stress only entered through FiLM modulation, the first GNN layer was modulating noise since node representations weren't yet stress-aware. Adding stress concatenation at input (like baselines do) was essential
 - **Data quality matters**: the last 3 quarters (2023Q2–Q4) have different column counts (68/67 vs 70 features) and anomalous rating distributions (89%+ D-rated), suggesting a dataset schema change. These quarters also show the strongest CascadeNet advantage — worth investigating whether it's real signal or artifact
-- **Eisenberg-Noe clearing is embarrassingly parallel but still the bottleneck** — 200 scenarios × 4548 nodes × ~50 iterations. The 32-quarter full run took several hours on CPU
+- **Eisenberg-Noe clearing is embarrassingly parallel but still the bottleneck** — 200 scenarios × 4548 nodes × ~50 iterations. The 32-quarter full run took almost two days on CPU
 
 ## License
 
