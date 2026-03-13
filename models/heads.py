@@ -1,14 +1,12 @@
+
 """
 Prediction heads for CascadeNet.
 
 DualHead:
   - Head A: default probability (binary classification logit)
   - Head B: cascade size = gate × magnitude
-    - gate:      P(cascade > 0)
-    - magnitude: expected cascade size (Softplus)
 
-Fix: stress input is [γ, β] concatenated (not averaged), preserving
-both scale and shift information with their distinct semantics.
+Fix: додано h_detached для ізоляції каскадних градієнтів від backbone.
 """
 
 import torch
@@ -16,20 +14,6 @@ import torch.nn as nn
 
 
 class DualHead(nn.Module):
-    """
-    Two-headed prediction from node embeddings + stress parameters.
-
-    Inputs:
-        h:     (N, h_dim)          — node embeddings from GNN
-        gamma: (1, stress_emb_dim) — FiLM scale parameter
-        beta:  (1, stress_emb_dim) — FiLM shift parameter
-
-    Outputs:
-        pd_logit:      (N,) — default probability logit
-        cascade_gate:  (N,) — cascade occurrence logit
-        cascade_size:  (N,) — expected cascade magnitude (>0)
-    """
-
     def __init__(
             self,
             h_dim: int = 64,
@@ -45,9 +29,33 @@ class DualHead(nn.Module):
             nn.GELU(),
         )
 
-        inp_compressed = h_dim + stress_emb_dim + input_dim
+        # ДВІ НЕЗАЛЕЖНІ гілки для обробки сирих фіч (вирішує конфлікт градієнтів)
+        self.x_proj_pd = nn.Sequential(
+            nn.Linear(input_dim, head_hidden),
+            nn.LayerNorm(head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden, head_hidden),
+            nn.GELU(),
+        )
 
-        # ФІКС: Окремі проекції для ізоляції градієнтів
+        self.x_proj_cas = nn.Sequential(
+            nn.Linear(input_dim, head_hidden),
+            nn.LayerNorm(head_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(head_hidden, head_hidden),
+            nn.GELU(),
+        )
+
+        # FIX: Нормалізація перед злиттям (LayerNorm для кожного потоку)
+        self.norm_h = nn.LayerNorm(h_dim)
+        self.norm_s = nn.LayerNorm(stress_emb_dim)
+        self.norm_x_pd = nn.LayerNorm(head_hidden)
+        self.norm_x_cas = nn.LayerNorm(head_hidden)
+
+        inp_compressed = h_dim + stress_emb_dim + head_hidden
+
         self.pd_proj = nn.Sequential(
             nn.Linear(inp_compressed, head_hidden),
             nn.LayerNorm(head_hidden),
@@ -60,40 +68,53 @@ class DualHead(nn.Module):
             nn.GELU(),
         )
 
+        # FIX: Dropout перенесено перед останнім шаром для кращої регуляризації
         self.pd_head = nn.Sequential(
-            nn.Dropout(0.1),
             nn.Linear(head_hidden, 64),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(64, 1),
         )
 
         self.cascade_gate = nn.Sequential(
-            nn.Dropout(0.1),
             nn.Linear(head_hidden, 64),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(64, 1),
         )
 
         self.cascade_magnitude = nn.Sequential(
-            nn.Dropout(0.1),
             nn.Linear(head_hidden, 64),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(64, 1),
             nn.Softplus(),
         )
 
-    def forward(self, h, gamma, beta, x):
+    def forward(self, h, gamma, beta, x, h_detached=None):
         stress_cat = torch.cat([gamma, beta], dim=-1)
         stress_repr = self.stress_compress(stress_cat)
         stress_repr = stress_repr.expand(h.size(0), -1)
 
-        inp = torch.cat([h, stress_repr, x], dim=-1)
+        # Нормалізуємо стрес
+        s_norm = self.norm_s(stress_repr)
 
-        # ФІКС: Розділяємо ознаки перед тим, як віддавати їх у голови
-        pd_feat = self.pd_proj(inp)
-        cas_feat = self.cas_proj(inp)
+        # PD-голова отримує свою версію табличних фіч
+        x_repr_pd = self.x_proj_pd(x)
 
+        # Зливаємо НОРМАЛІЗОВАНІ тензори
+        inp_pd = torch.cat([self.norm_h(h), s_norm, self.norm_x_pd(x_repr_pd)], dim=-1)
+        pd_feat = self.pd_proj(inp_pd)
         pd = self.pd_head(pd_feat).squeeze(-1)
+
+        # Каскадна голова отримує свою версію
+        x_repr_cas = self.x_proj_cas(x)
+        h_cas = h_detached if h_detached is not None else h
+
+        # Зливаємо НОРМАЛІЗОВАНІ тензори
+        inp_cas = torch.cat([self.norm_h(h_cas), s_norm, self.norm_x_cas(x_repr_cas)], dim=-1)
+        cas_feat = self.cas_proj(inp_cas)
+
         gate = self.cascade_gate(cas_feat).squeeze(-1)
         mag = self.cascade_magnitude(cas_feat).squeeze(-1) + 1e-6
 

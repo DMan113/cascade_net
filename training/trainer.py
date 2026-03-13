@@ -1,9 +1,11 @@
+
 """
 CascadeNet trainer with:
   - Gradient accumulation over multiple scenarios
   - Staged cascade weight schedule
   - Cosine annealing LR
   - Training history for visualization
+  - pd_only_ablation mode
 """
 
 import numpy as np
@@ -37,7 +39,9 @@ class CascadeNetTrainer:
         }
 
     def _cascade_weight(self, epoch: int) -> float:
-        """Linear ramp from cascade_weight_start → cascade_weight_end."""
+        # ── FIX: pd_only → cascade_weight завжди 0 ──────────────
+        if self.cfg.pd_only_ablation:
+            return 0.0
         t = min(1.0, epoch / self.cfg.epochs)
         s, e = self.cfg.cascade_weight_start, self.cfg.cascade_weight_end
         return s + (e - s) * t
@@ -63,7 +67,6 @@ class CascadeNetTrainer:
             pl, cg, cs = self.model(x, ei, ew, s)
             loss = cascadenet_loss(pl, cg, cs, y, cas, pw, cw)
 
-            # Scale loss for accumulation
             (loss / accum).backward()
             total_loss += loss.item()
             n_steps += 1
@@ -107,13 +110,23 @@ class CascadeNetTrainer:
         self, data, sc_train: List[Dict], sc_val: List[Dict],
     ) -> nn.Module:
         cfg = self.cfg
-        print(f"\n[CascadeNet] Training")
+        mode = "PD-only" if cfg.pd_only_ablation else (
+            "stop-grad cascade" if cfg.cascade_stop_grad else "full"
+        )
+        print(f"\n[CascadeNet] Training ({mode})")
         print(f"  {len(sc_train)} train / {len(sc_val)} val scenarios")
         print(f"  Params: {self.model.count_params():,}")
         print(f"  Device: {cfg.device}")
         print(f"  Grad accum: {cfg.grad_accum_steps} steps")
-        print(f"  Cascade weight: {cfg.cascade_weight_start} → "
-              f"{cfg.cascade_weight_end}\n")
+
+        if cfg.pd_only_ablation:
+            print(f"  Cascade weight: 0.0 (PD-only ablation)")
+        else:
+            print(f"  Cascade weight: {cfg.cascade_weight_start} → "
+                  f"{cfg.cascade_weight_end}")
+        if cfg.cascade_stop_grad:
+            print(f"  Stop-gradient on cascade branch: ENABLED")
+        print()
 
         for ep in range(1, cfg.epochs + 1):
             np.random.shuffle(sc_train)
@@ -150,3 +163,4 @@ class CascadeNetTrainer:
 
         print(f"  Best val loss: {self.best_val_loss:.4f}")
         return self.model
+

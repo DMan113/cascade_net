@@ -20,7 +20,7 @@ def plot_results(
     train_history: Dict,
     scenarios_test: List[Dict],
     cascade_preds: np.ndarray,
-    save_path: str = "cascadenet_results.png",
+    save_path: str = "cascadenet_results_ablation.png",
 ):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle("CascadeNet — Results Overview", fontsize=16, fontweight="bold")

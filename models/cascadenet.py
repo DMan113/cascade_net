@@ -1,8 +1,3 @@
-"""
-CascadeNet — Stress-Conditioned Cascade Risk Predictor.
-
-Full model: StressEncoder → FiLM-conditioned GNN → DualHead.
-"""
 
 import torch
 import torch.nn as nn
@@ -19,9 +14,8 @@ class CascadeNet(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.input_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
+        self.input_proj = nn.Linear(cfg.input_dim + cfg.stress_dim, cfg.hidden_dim)
 
-        # ФІКС: Окремий енкодер для кожного шару GNN
         self.stress_encoders = nn.ModuleList([
             StressEncoder(
                 stress_dim=cfg.stress_dim,
@@ -44,25 +38,56 @@ class CascadeNet(nn.Module):
             input_dim=cfg.input_dim,
         )
 
+        # ── FIX: stop-gradient прапорець ─────────────────────────
+        self.cascade_stop_grad = cfg.cascade_stop_grad
+
     def forward(
             self, x, edge_index, edge_weight, stress,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        h = self.input_proj(x)
-        last_gamma, last_beta = None, None
+        # Розширюємо стрес-вектор на всі вузли графа
+        if stress.dim() == 1:
+            stress_expanded = stress.unsqueeze(0).expand(x.size(0), -1)
+        else:
+            stress_expanded = stress.expand(x.size(0), -1)
 
+        # КОНКАТЕНУЄМО стрес із сирими фічами перед проекцією
+        h = self.input_proj(torch.cat([x, stress_expanded], dim=-1))
+
+        last_gamma, last_beta = None, None
         for layer, enc in zip(self.gnn_layers, self.stress_encoders):
             last_gamma, last_beta = enc(stress)
             h = layer(h, edge_index, edge_weight, last_gamma, last_beta)
 
-        # Передаємо сирий x у голову
-        return self.dual_head(h, last_gamma, last_beta, x)
+        # Далі без змін, як було...
+        if self.cascade_stop_grad:
+            pd_logit, cascade_gate, cascade_size = self.dual_head(
+                h, last_gamma, last_beta, x,
+                h_detached=h.detach(),
+            )
+        else:
+            pd_logit, cascade_gate, cascade_size = self.dual_head(
+                h, last_gamma, last_beta, x,
+            )
+
+        return pd_logit, cascade_gate, cascade_size
 
     def get_embeddings(self, x, edge_index, edge_weight, stress) -> torch.Tensor:
-        h = self.input_proj(x)
+        # 1. Розширюємо стрес-вектор
+        if stress.dim() == 1:
+            stress_expanded = stress.unsqueeze(0).expand(x.size(0), -1)
+        else:
+            stress_expanded = stress.expand(x.size(0), -1)
+
+        # 2. ОСЬ ФІКС: Конкатенуємо так само, як у forward!
+        h = self.input_proj(torch.cat([x, stress_expanded], dim=-1))
+
+        # 3. Пропускаємо через шари
+        last_gamma, last_beta = None, None
         for layer, enc in zip(self.gnn_layers, self.stress_encoders):
-            gamma, beta = enc(stress)
-            h = layer(h, edge_index, edge_weight, gamma, beta)
+            last_gamma, last_beta = enc(stress)
+            h = layer(h, edge_index, edge_weight, last_gamma, last_beta)
+
         return h.detach()
 
     def count_params(self) -> int:

@@ -28,7 +28,6 @@ def generate_scenarios(
     adj_T = adj_sparse.T.tocsr()
     liabilities = np.array(adj_sparse.sum(axis=1)).flatten()
 
-    # FIX 2: Compute assets taking into account incoming payments
     base_assets = _compute_base_assets(labels, rng, N, adj_sparse)
 
     stress_sens = _compute_stress_sensitivity(node_features)
@@ -39,23 +38,22 @@ def generate_scenarios(
     print(f"  Workers: {cfg.cascade_workers}, LGD: {cfg.lgd}")
     print(f"  Target default rate: {cfg.base_default_rate:.1%} – "
           f"{cfg.stress_max_default_rate:.1%}")
+    print(f"  Asset shock max: {cfg.asset_shock_max:.0%}, "
+          f"LGD stress max: +{cfg.lgd_stress_max:.2f}, "
+          f"LGD cap: {cfg.lgd_cap:.2f}")
 
     for i in tqdm(range(cfg.num_scenarios), desc="Scenarios"):
         stress = rng.uniform(0, 1, cfg.stress_dim).astype(np.float32)
         sl = stress.mean()
 
-        # FIX 1: Probabilistic default sampling instead of deterministic thresholds
         initial_defaults = _sample_stochastic_defaults(
             fund_pd, stress_sens, sl,
             cfg.base_default_rate, cfg.stress_max_default_rate, rng
         )
 
-        # Stress affects:
-        #   1. External assets decrease (economic downturn)
-        #   2. LGD increases (recovery rates drop)
-        #   3. Interbank obligations (liabilities) stay UNCHANGED
-        asset_shock = 1.0 - 0.25 * sl       # up to -25% asset reduction
-        stressed_lgd = min(0.9, cfg.lgd + 0.3 * sl)  # LGD: 0.45 → up to 0.75
+        # ── FIX: Використовуємо параметри з конфігу замість хардкоду ──
+        asset_shock = 1.0 - cfg.asset_shock_max * sl
+        stressed_lgd = min(cfg.lgd_cap, cfg.lgd + cfg.lgd_stress_max * sl)
         s_assets = base_assets * asset_shock
 
         all_defaults, n_contagion = multi_trigger_cascade(
@@ -85,7 +83,6 @@ def generate_scenarios(
     _print_summary(scenarios)
     return scenarios
 
-
 def split_scenarios(
     scenarios: List[Dict], cfg: Config,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
@@ -102,13 +99,11 @@ def split_scenarios(
           f"{len(sc_test)} test")
     return sc_train, sc_val, sc_test
 
-
 # ═══════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════
 
 def _compute_fundamental_pd(features: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    """PD from credit ratings + feature-based perturbation."""
     N = features.shape[0]
     n_feat = features.shape[1]
 
@@ -132,7 +127,6 @@ def _compute_fundamental_pd(features: np.ndarray, labels: np.ndarray) -> np.ndar
 
 
 def _compute_stress_sensitivity(features: np.ndarray) -> np.ndarray:
-    """How sensitive is each node to macro stress. in [0, 1]."""
     n_feat = features.shape[1]
     if n_feat >= 70:
         wholesale = features[:, 10] if n_feat > 10 else 0.5
@@ -145,55 +139,45 @@ def _compute_stress_sensitivity(features: np.ndarray) -> np.ndarray:
 
 
 def _sample_stochastic_defaults(fund_pd, stress_sens, stress_level, base_rate, max_rate, rng):
-    """
-    STOCHASTIC FIX: Compute stressed PDs and sample defaults probabilistically
-    so ML models cannot simply reverse-engineer a deterministic threshold.
-    """
-    # 1. Determine target macro default rate for this stress level
     target_rate = base_rate + (max_rate - base_rate) * stress_level
 
-    # 2. Shift the odds ratio based on bank's specific stress sensitivity
     odds = fund_pd / (1.001 - fund_pd)
     stress_multiplier = np.exp(stress_sens * stress_level * 3.0)
     new_odds = odds * stress_multiplier
 
     pd_stressed = new_odds / (1.0 + new_odds)
 
-    # 3. Calibrate globally so the expected default rate perfectly matches the macro target
     current_rate = pd_stressed.mean()
     if current_rate > 0:
         pd_stressed *= (target_rate / current_rate)
 
     pd_stressed = np.clip(pd_stressed, 0.001, 0.95)
 
-    # 4. Stochastic sampling
     return rng.rand(len(fund_pd)) < pd_stressed
 
 
 def _compute_base_assets(labels, rng, N, adj_sparse=None):
     """
-    ASSET FIX: External assets must account for BOTH liabilities (money owed)
-    AND incoming payments (money expected). Otherwise, nodes with high liabilities
-    but no incoming edges will structurally default at step 0.
+    FIX: Збільшені буфери для зменшення каскадного contagion.
+
+    v1: [1.50, 1.30, 1.15, 1.05] → занадто тонкий, 25-63% defaults
+    v2: [2.00, 1.70, 1.40, 1.20] → занадто товстий, 3.9% contagion
+    v3: [1.70, 1.45, 1.25, 1.10] → компроміс
     """
-    rating_buffer = np.array([1.50, 1.30, 1.15, 1.05])[np.clip(labels, 0, 3)]
+    rating_buffer = np.array([1.70, 1.45, 1.25, 1.10])[np.clip(labels, 0, 3)]
 
     if adj_sparse is not None:
         liabilities = np.array(adj_sparse.sum(axis=1)).flatten()
-        incoming = np.array(adj_sparse.sum(axis=0)).flatten()  # Money coming in
+        incoming = np.array(adj_sparse.sum(axis=0)).flatten()
 
         liabilities = np.maximum(liabilities, 1.0)
 
-        # Bank is solvent if: external_assets + incoming >= buffer * liabilities
-        # Therefore: external_assets = max(buffer * liabilities - incoming, safe_minimum)
         assets = (rating_buffer * liabilities) - incoming
 
-        # Ensure a safe minimum external asset floor (e.g. 15% of liabilities)
-        # to prevent instant defaults on minor asset shocks
-        min_assets = 0.15 * liabilities
+        min_assets = 0.20 * liabilities  # v1: 0.15, v2: 0.25, v3: 0.20
         assets = np.maximum(assets, min_assets)
 
-        noise = rng.uniform(0.9, 1.1, N).astype(np.float32)
+        noise = rng.uniform(0.95, 1.05, N).astype(np.float32)
         assets = assets * noise
     else:
         assets = rating_buffer * 100.0 + rng.exponential(10.0, N).astype(np.float32)
@@ -210,3 +194,5 @@ def _print_summary(scenarios):
     print(f"  Contagion fraction: {np.mean(cont):.1%} avg")
     print(f"  Contagion defaults: "
           f"{np.mean([s['n_contagion_defaults'] for s in scenarios]):.0f} avg/scenario")
+
+

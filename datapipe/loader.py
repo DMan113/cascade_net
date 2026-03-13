@@ -324,7 +324,7 @@ def _compute_network_features(src, tgt, weights, N: int) -> np.ndarray:
 
     # PageRank: increase iterations, handle convergence failure
     try:
-        pr = nx.pagerank(G, alpha=0.85, max_iter=500, tol=1e-4)
+        pr = nx.pagerank(G, alpha=0.85, max_iter=1000, tol=1e-4)
     except nx.PowerIterationFailedConvergence:
         print("  PageRank did not converge, using degree-based fallback")
         dg_sum = sum(dict(G.degree()).values()) or 1

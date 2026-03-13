@@ -11,28 +11,26 @@ update MLP — only [h, sa] — removing the "escape hatch" from FiLM.
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import MessagePassing
+from torch_geometric.nn import MessagePassing, GATConv
 
 
-class StressCondGNNLayer(MessagePassing):
+class StressCondGNNLayer(nn.Module):  # Більше не MessagePassing, бо використовуємо готову conv
     """
-    GNN layer with FiLM stress conditioning on aggregated messages.
-
-    Update: h' = MLP([h, γ·agg + β]) + h
+    GNN layer with FiLM stress conditioning on GAT aggregated messages.
+    Update: h' = MLP([h, agg + γ·agg + β]) + h
     """
 
     def __init__(self, h_dim: int, stress_emb_dim: int, dropout: float = 0.1):
-        super().__init__(aggr="add")
-        self.msg_mlp = nn.Sequential(
-            nn.Linear(h_dim, h_dim),
-            nn.GELU(),
-        )
+        super().__init__()
+        # FIX: Щоб розмірність не роздулася в 4 рази (h_dim * heads),
+        # ставимо concat=False, тоді воно усереднить голови і поверне h_dim
+        self.conv = GATConv(h_dim, h_dim, heads=4, concat=False, dropout=dropout)
+
         self.stress_proj = (
             nn.Linear(stress_emb_dim, h_dim)
             if stress_emb_dim != h_dim
             else nn.Identity()
         )
-        # Only [h, stress_modulated_agg] — no raw agg
         self.upd_mlp = nn.Sequential(
             nn.Linear(h_dim * 2, h_dim),
             nn.LayerNorm(h_dim),
@@ -41,7 +39,9 @@ class StressCondGNNLayer(MessagePassing):
         )
 
     def forward(self, h, edge_index, edge_weight, gamma, beta):
-        agg = self.propagate(edge_index, x=h, edge_weight=edge_weight)
+        # FIX: РЕАЛЬНО використовуємо GATConv замість тупого propagate
+        # PyG GATConv приймає edge_weight як edge_attr
+        agg = self.conv(h, edge_index, edge_attr=edge_weight)
 
         g = self.stress_proj(gamma)
         b = self.stress_proj(beta)
@@ -49,8 +49,8 @@ class StressCondGNNLayer(MessagePassing):
             g = g.expand(h.size(0), -1)
             b = b.expand(h.size(0), -1)
 
-        # FiLM modulation
-        sa = g * agg + b
+        # FiLM + Residual
+        sa = agg + (g * agg + b)
 
         return self.upd_mlp(torch.cat([h, sa], dim=-1)) + h
 

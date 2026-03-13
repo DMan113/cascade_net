@@ -66,7 +66,7 @@ def cascadenet_loss(
     return L_pd + cascade_weight * (L_gate + L_cascade)
 
 
-def compute_pos_weight(labels: np.ndarray, lo: float = 1.0, hi: float = 20.0) -> float:
+def compute_pos_weight(labels: np.ndarray, lo: float = 1.0, hi: float = 5.0) -> float:
 
     """
     Compute class weight for imbalanced binary classification.
