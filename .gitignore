@@ -7,10 +7,10 @@ datasets/
 outputs/
 *.pt
 *.pth
-*.png
 *.jpg
 *.jpeg
 *.log
+
 
 
 __pycache__/
