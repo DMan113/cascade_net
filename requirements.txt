@@ -1,0 +1,19 @@
+# Deep Learning & Graphs
+torch>=2.0.0
+torch-geometric>=2.3.0
+
+# Data Manipulation & Math
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+networkx>=2.6.3
+
+# Machine Learning & Baselines
+scikit-learn>=1.0.2
+xgboost>=1.5.0
+joblib>=1.1.0
+
+# Visualization & Utilities
+matplotlib>=3.5.0
+seaborn>=0.11.2
+tqdm>=4.62.3
